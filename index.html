@@ -3,13 +3,13 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>Vision ANN/SNN Trainer (browser, v001)</title>
+<title>Vision ANN/SNN Trainer (browser, v002)</title>
 <!--
 ======================================================================
 VISION ANN/SNN TRAINER - BROWSER EDITION
-index-v001.html
+index-v002.html
 
-Companion to vision-ann-snn-v046.ino. Trains an ANN and an SNN classifier
+Companion to firmware-v002.ino. Trains an ANN and an SNN classifier
 on this device's camera (webcam on iOS/Android/desktop via getUserMedia);
 weight files are byte-compatible with the firmware.
 
@@ -32,7 +32,13 @@ INPUT_SIZE, NUM_CHANNELS (1=grayscale, 3=RGB), and the number/names of
 classes are all adjustable here - changing any of them changes the model's
 size, so it resets both models to fresh weights (same as changing #defines
 and reflashing the device). The "Device settings" panel shows the exact
-lines to copy into vision-ann-snn-v046.ino to match.
+lines to copy into firmware-v002.ino to match.
+
+WHAT CHANGED FROM v001
+  The Collect panel now sits directly under the Camera card (was down near
+  the bottom of the page) and opening it scrolls the camera into view, so
+  you can see exactly what you're about to capture instead of scrolling
+  back and forth between the live feed and the capture buttons.
 
 STORAGE: same pattern as the motion trainer - a real folder via the File
 System Access API where supported (Android Chrome/desktop Chrome), or
@@ -109,11 +115,11 @@ motion project). Use at your own risk! MIT license.
 <body>
 <div id="app">
 
-  <h1>Vision ANN/SNN Trainer <span class="small">- browser edition, v001</span></h1>
-  <p class="small">Companion to <b>vision-ann-snn-v046.ino</b>. Trains both models on this device's camera;
+  <h1>Vision ANN/SNN Trainer <span class="small">- browser edition, v002</span></h1>
+  <p class="small">Companion to <b>firmware-v002.ino</b>. Trains both models on this device's camera;
   weight files are byte-compatible with the firmware.</p>
 
-  <div class="card">
+  <div class="card" id="cameraCard">
     <h2>Camera</h2>
     <div class="videoWrap">
       <video id="videoEl" autoplay muted playsinline></video>
@@ -125,6 +131,21 @@ motion project). Use at your own risk! MIT license.
     </div>
     <p class="small" id="cameraStatus">Camera: <span class="bad">not enabled</span></p>
     <div id="predBanner" class="predBanner hidden"></div>
+  </div>
+
+  <div class="card hidden" id="collectPanel">
+    <h2 id="collectTitle">Collect</h2>
+    <p class="small" id="collectCount"></p>
+    <div class="row">
+      <button id="btnCaptureOne" class="primary">Capture 1</button>
+      <button id="btnAutoCollect" class="good">Auto x10</button>
+      <label class="btn" for="fileImportImages" style="display:inline-flex;">Import Images&hellip;</label>
+      <input type="file" id="fileImportImages" accept="image/*" multiple class="hidden">
+      <button id="btnDeleteClass" class="danger">Delete Class</button>
+      <button id="btnCloseCollect">Close</button>
+    </div>
+    <p class="small">The camera feed above stays live while this is open, so you can see exactly what
+    you're about to capture.</p>
   </div>
 
   <div class="card" id="setupCard">
@@ -151,19 +172,6 @@ motion project). Use at your own risk! MIT license.
     <div class="row" style="margin-top:6px;">
       <input type="text" id="newClassName" placeholder="new class name">
       <button id="btnAddClass" class="primary">+ Add Class</button>
-    </div>
-  </div>
-
-  <div class="card hidden" id="collectPanel">
-    <h2 id="collectTitle">Collect</h2>
-    <p class="small" id="collectCount"></p>
-    <div class="row">
-      <button id="btnCaptureOne" class="primary">Capture 1</button>
-      <button id="btnAutoCollect" class="good">Auto x10</button>
-      <label class="btn" for="fileImportImages" style="display:inline-flex;">Import Images&hellip;</label>
-      <input type="file" id="fileImportImages" accept="image/*" multiple class="hidden">
-      <button id="btnDeleteClass" class="danger">Delete Class</button>
-      <button id="btnCloseCollect">Close</button>
     </div>
   </div>
 
@@ -228,7 +236,7 @@ motion project). Use at your own risk! MIT license.
   </details>
 
   <details class="card">
-    <summary>Device settings (copy into vision-ann-snn-v046.ino)</summary>
+    <summary>Device settings (copy into firmware-v002.ino)</summary>
     <textarea id="deviceSettings" readonly style="margin-top:8px;"></textarea>
     <div class="row" style="margin-top:8px;"><button id="btnCopyDeviceSettings">Copy</button></div>
   </details>
@@ -246,7 +254,7 @@ motion project). Use at your own risk! MIT license.
 'use strict';
 
 // ======================================================================
-// CONFIG - matches vision-ann-snn-v046.ino. Kernel sizes and filter counts
+// CONFIG - matches firmware-v002.ino. Kernel sizes and filter counts
 // are fixed (the device doesn't make those configurable); resolution,
 // channels, and the class list are all adjustable and change the model's
 // SIZE, so changing any of them rebuilds both models from scratch.
@@ -807,7 +815,7 @@ function rebuildArchitecture(){
 }
 
 // ======================================================================
-// ANN MODEL - ported from vision-ann-snn-v046.ino's myAnnForward, plus a
+// ANN MODEL - ported from firmware-v002.ino's myAnnForward, plus a
 // standard backprop derivation (the device no longer trains, so there is
 // no C backward pass to port from - only the forward pass, which both
 // sides must match exactly, is shared).
@@ -947,7 +955,7 @@ async function annLoadWeights(){ const buf = await Store.readWeightFile(ANN_WEIG
 
 // ======================================================================
 // SNN MODEL - synthetic-timestep rate-coded LIF vision classifier.
-// Same forward math as vision-ann-snn-v046.ino's mySnnForwardInfer, with
+// Same forward math as firmware-v002.ino's mySnnForwardInfer, with
 // per-timestep recording added so backward (surrogate-gradient BPTT) is
 // possible. Recording is always on (even during live inference) since it's
 // also what feeds the heatmap - the extra memory is trivial at this scale.
@@ -1166,6 +1174,7 @@ let collectClassIdx = -1;
 function openCollect(classIdx){
   collectClassIdx = classIdx;
   document.getElementById('collectPanel').classList.remove('hidden');
+  document.getElementById('cameraCard').scrollIntoView({ behavior:'smooth', block:'start' });
   refreshCollectCount();
 }
 async function refreshCollectCount(){
