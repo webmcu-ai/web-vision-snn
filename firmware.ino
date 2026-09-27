@@ -1,8 +1,8 @@
 // ======================================================
 // XIAO ML KIT (OR XIAO ESP32S3 SENSE)
-// VISION ML - ANN + SNN INFERENCE ONLY - v046
+// VISION ML - ANN + SNN INFERENCE ONLY - v002
 //
-// Companion firmware to the browser trainer (index-vision-v001.html).
+// Companion firmware to the browser trainer (index-v002.html).
 // All training now happens in the browser; this firmware COLLECTS images
 // and RUNS INFERENCE with two classifiers trained on the same architecture:
 //   ANN  Conv1(3x3)->Pool->Conv2(3x3)->Dense->softmax, ordinary neurons.
@@ -15,28 +15,31 @@
 //        read off the flattened Conv2 spikes, accumulates over all steps;
 //        its value after the last step is softmaxed for the prediction.
 //        (Trained in the browser via surrogate-gradient BPTT through the
-//        synthetic timesteps - see index-vision-v001.html.)
+//        synthetic timesteps - see index-v002.html.)
 //
-// WHAT CHANGED FROM v44 (on-device-vision-ai)
-//   - On-device TRAINING REMOVED (myBackward*, myAdamUpdate, myUpdateWeights,
-//     myActionTrain, myLoadImageFromFile all deleted - they were training-only).
-//     Train in the browser instead; drop the two SD card headers here.
-//   - SNN inference ADDED. Same architecture shapes as the ANN (CONV1_FILTERS,
-//     CONV2_FILTERS, FLATTENED_SIZE, OUTPUT_WEIGHTS are shared #defines), so
-//     the ANN and SNN weight buffers are the same sizes - only the neuron
-//     model and the SNN's extra time loop differ.
-//   - INPUT_SIZE and NUM_CHANNELS are both now real settings, not just
-//     INPUT_SIZE. NUM_CHANNELS=3 is RGB (original behaviour), NUM_CHANNELS=1
-//     is grayscale (luminance-converted from the color sensor at preprocess
-//     time - the camera and JPEG files on SD are unaffected either way).
-//     Whichever combination you train in the browser, set the SAME two
-//     #defines here before flashing.
-//   - LIF_LEAK / LIF_THRESHOLD / SNN_TRACE_LEAK / SNN_TIMESTEPS are NOT
-//     stored in the weight file (same convention as the motion firmware) -
-//     they must match whatever the browser trainer used. Check the
-//     browser's Status panel after training and copy its values here.
-//   - Menu's last two items are now "Infer ANN" and "Infer SNN" (was
-//     "Train" and "Infer").
+// WHAT CHANGED FROM v046
+//   The SNN infer loop used to always run all SNN_TIMESTEPS before printing
+//   anything - a still image has no real time axis, so unlike the motion
+//   firmware's windowed voting (which waits for genuinely NEW evidence to
+//   arrive over real time), there was never anything to "wait for" here:
+//   the synthetic timesteps only exist to average out THIS frame's own
+//   rate-coding noise. Once the running trace is already confident, more
+//   steps buy nothing. So now:
+//     - Every synthetic timestep's running softmax is printed to Serial as
+//       it happens (see the "[SNN step t/T]" lines), so you can watch the
+//       trace converge instead of waiting for the whole thing to finish.
+//     - Once at least SNN_MIN_TIMESTEPS have run AND the leading class's
+//       probability is >= SNN_COMMIT_MIN_PROB AND it beats the runner-up
+//       by >= SNN_COMMIT_MARGIN, inference stops immediately instead of
+//       running the remaining steps - easy frames finish much faster,
+//       ambiguous frames still get the full SNN_TIMESTEPS budget.
+//     - mySnnForwardInfer() now returns the timestep it settled at, purely
+//       for the "(settled after n/T steps)" log line.
+//   SNN_MIN_TIMESTEPS / SNN_COMMIT_MIN_PROB / SNN_COMMIT_MARGIN are new,
+//   device-only inference knobs - they don't affect training (which still
+//   uses the full SNN_TIMESTEPS every time) and have no browser counterpart
+//   to keep in sync, unlike LIF_LEAK/LIF_THRESHOLD/SNN_TRACE_LEAK/
+//   SNN_TIMESTEPS which still must match the browser's training settings.
 //
 // SD card stores: images in class folders (unchanged)
 // SD card reads:  /header/myWeights.bin (ANN), /header/mySnnWeights.bin (SNN)
@@ -178,6 +181,14 @@ bool mySnnTrained = false;   // true once mySnnWeights.bin loaded successfully
 float LIF_LEAK = 0.90f;
 float LIF_THRESHOLD = 0.50f;
 float SNN_TRACE_LEAK = 0.95f;
+
+// ======================================================
+// SNN EARLY-EXIT (device-only inference tuning - no browser counterpart,
+// does not affect training). See "WHAT CHANGED FROM v046" above.
+// ======================================================
+#define SNN_MIN_TIMESTEPS 4       // always run at least this many synthetic steps first
+float SNN_COMMIT_MIN_PROB = 0.90f; // ...then stop as soon as the leader reaches this probability
+float SNN_COMMIT_MARGIN   = 0.60f; // ...and beats the runner-up by at least this much
 
 // ======================================================
 // GLOBAL VARIABLE DEFINITIONS
@@ -372,7 +383,7 @@ void myHandleMenuNavigation();
 void myDrawMenu();
 bool myCaptureAndPreprocess();
 void myAnnForward();
-void mySnnForwardInfer();
+int mySnnForwardInfer();
 
 // ======================================================
 // PART 0: SETUP AND LOOP
@@ -664,15 +675,18 @@ void myAnnForward() {
 }
 
 // ---- SNN forward pass (inference only): fills mySnnDense_output[NUM_CLASSES] ----
-// Runs SNN_TIMESTEPS synthetic steps. Each step rate-codes myInputBuffer into a
-// fresh Bernoulli spike frame, runs it through two LIF conv layers (membrane
+// Runs up to SNN_TIMESTEPS synthetic steps, but MAY STOP EARLY (see the header
+// comment's "WHAT CHANGED FROM v046"). Each step rate-codes myInputBuffer into
+// a fresh Bernoulli spike frame, runs it through two LIF conv layers (membrane
 // potential persists across steps), and accumulates a leaky per-class trace
-// from the flattened Conv2 spikes. After the last step the trace is softmaxed.
-void mySnnForwardInfer() {
+// from the flattened Conv2 spikes. Prints every step's running softmax to
+// Serial. Returns the timestep it settled at (1..SNN_TIMESTEPS).
+int mySnnForwardInfer() {
   memset(mySnnC1Mem, 0, CONV1_FILTERS*CONV1_OUTPUT_SIZE*CONV1_OUTPUT_SIZE*sizeof(float));
   memset(mySnnC2Mem, 0, CONV2_FILTERS*CONV2_OUTPUT_SIZE*CONV2_OUTPUT_SIZE*sizeof(float));
   memset(mySnnTrace, 0, NUM_CLASSES*sizeof(float));
 
+  int settledAt = SNN_TIMESTEPS;
   for (int t=0; t<SNN_TIMESTEPS; t++) {
     // 1) rate-code this step's spike frame from the (0-1) input probabilities
     for (int i=0;i<INPUT_SIZE*INPUT_SIZE*NUM_CHANNELS;i++)
@@ -734,11 +748,31 @@ void mySnnForwardInfer() {
       for (int i=0;i<FLATTENED_SIZE;i++) current += mySnnC2Spike[i]*mySnnOutput_w[c*FLATTENED_SIZE+i];
       mySnnTrace[c] = mySnnTrace[c]*SNN_TRACE_LEAK + current;
     }
-  }
 
-  float mx = mySnnTrace[0]; for (int i=1;i<NUM_CLASSES;i++) mx = max(mx, mySnnTrace[i]);
-  float expSum=0; for (int i=0;i<NUM_CLASSES;i++) expSum += exp(mySnnTrace[i]-mx);
-  for (int i=0;i<NUM_CLASSES;i++) mySnnDense_output[i] = exp(mySnnTrace[i]-mx)/expSum;
+    // Running softmax of the trace SO FAR, printed every step so you can watch
+    // it converge. This is also what lets us stop early: once it's confident,
+    // running the remaining steps would only re-average noise we already
+    // averaged out - there's no new evidence coming, unlike a real time series.
+    float stepProbs[NUM_CLASSES];
+    memcpy(stepProbs, mySnnTrace, sizeof(stepProbs));
+    float mxStep = stepProbs[0]; for (int i=1;i<NUM_CLASSES;i++) mxStep = max(mxStep, stepProbs[i]);
+    float expSumStep=0; for (int i=0;i<NUM_CLASSES;i++) expSumStep += exp(stepProbs[i]-mxStep);
+    for (int i=0;i<NUM_CLASSES;i++) stepProbs[i] = exp(stepProbs[i]-mxStep)/expSumStep;
+
+    int best=0, second=-1;
+    for (int i=1;i<NUM_CLASSES;i++) if (stepProbs[i]>stepProbs[best]) best=i;
+    for (int i=0;i<NUM_CLASSES;i++){ if (i==best) continue; if (second==-1 || stepProbs[i]>stepProbs[second]) second=i; }
+    float margin = stepProbs[best]-stepProbs[second];
+    Serial.printf("  [SNN step %d/%d] %s p=%.2f margin=%.2f\n", t+1, SNN_TIMESTEPS, myClassLabels[best].c_str(), stepProbs[best], margin);
+
+    memcpy(mySnnDense_output, stepProbs, sizeof(stepProbs));
+
+    if (t+1 >= SNN_MIN_TIMESTEPS && stepProbs[best] >= SNN_COMMIT_MIN_PROB && margin >= SNN_COMMIT_MARGIN) {
+      settledAt = t+1;
+      break;
+    }
+  }
+  return settledAt;
 }
 
 // Shared OLED+Serial display for a completed inference frame - used by both infer modes.
@@ -803,14 +837,17 @@ void myActionInferSnn() {
   Serial.println("\n>>> Infer SNN. Serial/touch: t or l = exit");
   Serial.printf("    SNN_TIMESTEPS=%d LIF_LEAK=%.2f LIF_THRESHOLD=%.2f SNN_TRACE_LEAK=%.2f - must match the browser's training settings.\n",
                 SNN_TIMESTEPS, LIF_LEAK, LIF_THRESHOLD, SNN_TRACE_LEAK);
+  Serial.printf("    Early exit (device-only, no browser match needed): min %d steps, then stop once prob>=%.2f and margin>=%.2f.\n",
+                SNN_MIN_TIMESTEPS, SNN_COMMIT_MIN_PROB, SNN_COMMIT_MARGIN);
   myResetTouchState();
   int frameCount = 0;
   while (true) {
     if (Serial.available()) { char c = Serial.read(); if (c=='t'||c=='T'||c=='l'||c=='L') { myResetMenuState(); return; } }
     unsigned long t0 = millis();
     if (myCaptureAndPreprocess()) {
-      mySnnForwardInfer();
+      int settledAt = mySnnForwardInfer();
       myShowInferenceResult("SNN", mySnnDense_output, millis()-t0);
+      Serial.printf("    (settled after %d/%d steps)\n", settledAt, SNN_TIMESTEPS);
     }
     frameCount++;
     if (frameCount >= 5) {
